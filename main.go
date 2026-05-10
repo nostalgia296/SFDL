@@ -11,11 +11,13 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/bmaupin/go-epub"
 	"github.com/google/uuid"
 )
 
@@ -52,7 +54,6 @@ func init() {
 	}
 }
 
-// 替换函数
 func replaceChars(text string) string {
 	var result strings.Builder
 	for _, char := range text {
@@ -65,7 +66,6 @@ func replaceChars(text string) string {
 	return result.String()
 }
 
-// 初始化 nonce
 func initNonce() {
 	for {
 		nonce = strings.ToUpper(uuid.New().String())
@@ -87,7 +87,6 @@ func initNonce() {
 	fmt.Println("初始化完成")
 }
 
-// 计算 sign
 func getSign(nonce string, timestamp int64, deviceToken string) string {
 	longNonce := []byte(strings.Repeat(nonce, 4))
 
@@ -153,7 +152,6 @@ func getSign(nonce string, timestamp int64, deviceToken string) string {
 	return strings.ToUpper(hex.EncodeToString(hash[:]))
 }
 
-// HTTP 请求
 func request(method, url string, body []byte) (map[string]interface{}, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
 
@@ -387,6 +385,268 @@ func checkLogin() bool {
 	return getHTTPCode(resp) != 200
 }
 
+// 生成EPUB文件
+func generateEpub(title, author, coverURL string, volumes []Volume) error {
+	e := epub.NewEpub(title)
+	e.SetAuthor(author)
+
+	// 下载并设置封面
+	var coverPath string
+	if coverURL != "" {
+		fmt.Println("正在下载封面...")
+		var err error
+		coverPath, err = downloadCover(coverURL)
+		if err == nil {
+			internalCoverPath, err := e.AddImage(coverPath, "cover.jpg")
+			if err == nil {
+				e.SetCover(internalCoverPath, "")
+				fmt.Println("封面已添加")
+			} else {
+				fmt.Printf("添加封面到EPUB失败: %v\n", err)
+			}
+		} else {
+			fmt.Printf("封面下载失败: %v\n", err)
+		}
+	}
+
+	// 用于追踪已下载的图片，避免重复下载
+	downloadedImages := make(map[string]string)
+	imageCounter := 0
+	// 记录所有临时图片文件，等EPUB写入完成后再删除
+	var tempImageFiles []string
+
+	for _, vol := range volumes {
+		// 添加卷标题页
+		if vol.Title != "" {
+			volTitleHTML := fmt.Sprintf(`<h1 style="text-align:center; margin-top: 40%%;">%s</h1>`, htmlEscape(vol.Title))
+			_, err := e.AddSection(volTitleHTML, vol.Title, "", "")
+			if err != nil {
+				fmt.Printf("  添加卷标题 %s 失败: %v\n", vol.Title, err)
+			}
+		}
+
+		// 为每卷创建章节
+		for _, chapID := range vol.Chapters {
+			chap, err := downloadChapter(chapID)
+			if err != nil {
+				fmt.Printf("  %s 下载失败: %v\n", chapID, err)
+				continue
+			}
+			fmt.Printf("  %s 已下载\n", chap.Title)
+
+			// 将章节内容转换为HTML
+			// 先转义HTML特殊字符，再转换图片标签
+			escapedContent := htmlEscape(chap.Content)
+			// 将转义后的图片标签还原，然后转换[img]标签
+			processedContent := convertImgTags(restoreEscapedImgTags(escapedContent))
+
+			// 下载章节中的图片并嵌入EPUB，替换为本地路径
+			processedContent, err = embedImages(e, processedContent, downloadedImages, &imageCounter, &tempImageFiles)
+			if err != nil {
+				fmt.Printf("  嵌入图片失败: %v\n", err)
+			}
+
+			htmlContent := fmt.Sprintf(`<h1>%s</h1><p>%s</p>`,
+				htmlEscape(chap.Title),
+				strings.ReplaceAll(processedContent, "\n", "</p><p>"))
+
+			_, err = e.AddSection(htmlContent, chap.Title, "", "")
+			if err != nil {
+				fmt.Printf("  添加章节 %s 失败: %v\n", chap.Title, err)
+				continue
+			}
+		}
+	}
+
+	// 清理标题中的非法字符
+	titleClean := regexp.MustCompile(`[\\/:*?"<>|]`).ReplaceAllString(title, " ")
+	filename := fmt.Sprintf("%s.epub", titleClean)
+
+	if err := e.Write(filename); err != nil {
+		return fmt.Errorf("保存EPUB失败: %v", err)
+	}
+
+	// EPUB写入完成后再删除临时文件
+	if coverPath != "" {
+		os.Remove(coverPath)
+	}
+	for _, tempFile := range tempImageFiles {
+		os.Remove(tempFile)
+	}
+
+	fmt.Printf("\n已保存为 EPUB: %s\n", filename)
+	return nil
+}
+
+// embedImages 下载HTML中的外部图片，嵌入EPUB，并替换src为本地路径
+func embedImages(e *epub.Epub, htmlContent string, downloadedImages map[string]string, counter *int, tempFiles *[]string) (string, error) {
+	imgRegex := regexp.MustCompile(`<img[^>]+src=["']([^"']+)["'][^>]*>`)
+	matches := imgRegex.FindAllStringSubmatch(htmlContent, -1)
+
+	for _, match := range matches {
+		if len(match) < 2 {
+			continue
+		}
+		fullTag := match[0]
+		imgURL := match[1]
+		if !strings.HasPrefix(imgURL, "http://") && !strings.HasPrefix(imgURL, "https://") {
+			continue
+		}
+
+		var internalPath string
+		if existingPath, ok := downloadedImages[imgURL]; ok {
+			internalPath = existingPath
+		} else {
+			// 下载图片
+			tempFile, err := downloadImageToTemp(imgURL)
+			if err != nil {
+				fmt.Printf("    下载图片失败 %s: %v\n", imgURL, err)
+				continue
+			}
+			*tempFiles = append(*tempFiles, tempFile)
+
+			// 获取文件扩展名
+			ext := filepath.Ext(imgURL)
+			if ext == "" {
+				ext = ".jpg"
+			}
+			// 清理扩展名中的查询参数
+			if idx := strings.Index(ext, "?"); idx != -1 {
+				ext = ext[:idx]
+			}
+			if ext == "" {
+				ext = ".jpg"
+			}
+
+			*counter++
+			internalName := fmt.Sprintf("img_%04d%s", *counter, ext)
+
+			internalPath, err = e.AddImage(tempFile, internalName)
+			if err != nil {
+				fmt.Printf("    添加图片到EPUB失败 %s: %v\n", imgURL, err)
+				continue
+			}
+			downloadedImages[imgURL] = internalPath
+			fmt.Printf("    已嵌入图片: %s\n", internalName)
+		}
+
+		// 替换 src 属性
+		newTag := regexp.MustCompile(`src=["'][^"']+["']`).ReplaceAllString(fullTag, fmt.Sprintf(`src="%s"`, internalPath))
+		htmlContent = strings.Replace(htmlContent, fullTag, newTag, 1)
+	}
+
+	return htmlContent, nil
+}
+
+// downloadImageToTemp 下载图片到临时文件
+func downloadImageToTemp(url string) (string, error) {
+	client := &http.Client{Timeout: 30 * time.Second}
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Set("User-Agent", headers["user-agent"])
+	req.Header.Set("Accept", "image/webp,image/apng,image/*,*/*;q=0.8")
+	req.Header.Set("Referer", "https://book.sfacg.com/")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("状态码: %d", resp.StatusCode)
+	}
+
+	file, err := os.CreateTemp("", "img_*")
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	_, err = io.Copy(file, resp.Body)
+	if err != nil {
+		os.Remove(file.Name())
+		return "", err
+	}
+
+	return file.Name(), nil
+}
+
+// HTML转义
+func htmlEscape(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	s = strings.ReplaceAll(s, `"`, "&quot;")
+	s = strings.ReplaceAll(s, "'", "&#39;")
+	return s
+}
+
+// 转换 [img=width,height]url[/img] 为 HTML img 标签
+func convertImgTags(content string) string {
+	re := regexp.MustCompile(`\[img(?:=(\d+),(\d+))?\](.*?)\[/img\]`)
+	return re.ReplaceAllStringFunc(content, func(match string) string {
+		submatches := re.FindStringSubmatch(match)
+		if submatches == nil {
+			return match
+		}
+		width := submatches[1]
+		height := submatches[2]
+		url := submatches[3]
+
+		if width != "" && height != "" {
+			return fmt.Sprintf(`<img src="%s" width="%s" height="%s" />`, url, width, height)
+		}
+		return fmt.Sprintf(`<img src="%s" />`, url)
+	})
+}
+
+func restoreEscapedImgTags(content string) string {
+	// 还原被转义的方括号
+	content = strings.ReplaceAll(content, "&#91;", "[")
+	content = strings.ReplaceAll(content, "&#93;", "]")
+	return content
+}
+
+// 下载封面图片
+func downloadCover(url string) (string, error) {
+	client := &http.Client{Timeout: 30 * time.Second}
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Set("User-Agent", headers["user-agent"])
+	req.Header.Set("Accept", "image/webp,image/apng,image/*,*/*;q=0.8")
+	req.Header.Set("Referer", "https://book.sfacg.com/")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("下载封面失败，状态码: %d", resp.StatusCode)
+	}
+	file, err := os.CreateTemp("", "cover.jpg")
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	_, err = io.Copy(file, resp.Body)
+	if err != nil {
+		os.Remove(file.Name())
+		return "", err
+	}
+
+	return file.Name(), nil
+}
+
 func main() {
 	initNonce()
 
@@ -432,7 +692,7 @@ func main() {
 
 	headers["user-agent"] = fmt.Sprintf("boluobao/5.2.16(android;35)/OPPO/%s/OPPO", strings.ToLower(DeviceToken))
 
-	title, author, _, volumes := getCatalog(novelID)
+	title, author, cover, volumes := getCatalog(novelID)
 	if title == "标题获取失败" || title == "目录获取失败" {
 		fmt.Println("获取小说信息失败")
 		return
@@ -445,42 +705,57 @@ func main() {
 		fmt.Printf("%d: %s (%d章)\n", i+1, vol.Title, len(vol.Chapters))
 	}
 
+	// 选择下载格式
+	fmt.Println("\n请选择下载格式:")
+	fmt.Println("1: TXT")
+	fmt.Println("2: EPUB")
+	fmt.Print("输入选项 (1/2): ")
+	format, _ := reader.ReadString('\n')
+	format = strings.TrimSpace(format)
+
 	fmt.Println("\n开始下载全部卷...")
 
-	// 清理标题
 	titleClean := regexp.MustCompile(`[\\/:*?"<>|]`).ReplaceAllString(title, " ")
 
-	// 下载所有内容
-	var content strings.Builder
-	content.WriteString(title + "\n\n")
-	content.WriteString("作者: " + author + "\n\n")
+	switch format {
+	case "2":
+		// EPUB格式
+		if err := generateEpub(title, author, cover, volumes); err != nil {
+			fmt.Printf("生成EPUB失败: %v\n", err)
+		}
+	default:
+		// TXT格式
+		var content strings.Builder
+		content.WriteString(title + "\n\n")
+		content.WriteString("作者: " + author + "\n\n")
 
-	for i, vol := range volumes {
-		fmt.Printf("\n正在下载: %s\n", vol.Title)
-		content.WriteString(vol.Title + "\n\n")
+		for i, vol := range volumes {
+			fmt.Printf("\n正在下载: %s\n", vol.Title)
+			content.WriteString(vol.Title + "\n\n")
 
-		for _, chapID := range vol.Chapters {
-			chap, err := downloadChapter(chapID)
-			if err != nil {
-				fmt.Printf("  %s 下载失败: %v\n", chapID, err)
-				continue
+			for _, chapID := range vol.Chapters {
+				chap, err := downloadChapter(chapID)
+				if err != nil {
+					fmt.Printf("  %s 下载失败: %v\n", chapID, err)
+					continue
+				}
+				fmt.Printf("  %s 已下载\n", chap.Title)
+				content.WriteString(chap.Title + "\n")
+				content.WriteString(chap.Content + "\n\n")
 			}
-			fmt.Printf("  %s 已下载\n", chap.Title)
-			content.WriteString(chap.Title + "\n")
-			content.WriteString(chap.Content + "\n\n")
+
+			if i < len(volumes)-1 {
+				content.WriteString("\n")
+			}
 		}
 
-		if i < len(volumes)-1 {
-			content.WriteString("\n")
+		// 保存文件
+		filename := fmt.Sprintf("%s.txt", titleClean)
+		if err := os.WriteFile(filename, []byte(content.String()), 0644); err != nil {
+			fmt.Printf("保存失败: %v\n", err)
+			return
 		}
-	}
 
-	// 保存文件
-	filename := fmt.Sprintf("%s.txt", titleClean)
-	if err := os.WriteFile(filename, []byte(content.String()), 0644); err != nil {
-		fmt.Printf("保存失败: %v\n", err)
-		return
+		fmt.Printf("\n已保存为 TXT: %s\n", filename)
 	}
-
-	fmt.Printf("\n已保存为 TXT: %s\n", filename)
 }
