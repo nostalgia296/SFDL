@@ -1,0 +1,31 @@
+# Binaries
+build/
+sfdl
+*.exe
+
+# Output files
+*.epub
+*.txt
+
+# Cookie
+cookie.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Dependency directories
+vendor/
